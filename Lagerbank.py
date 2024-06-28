@@ -1,25 +1,31 @@
 #!/usr/bin/python3
-from calendar import c
+# Standard library imports
+import datetime
+from datetime import datetime, timedelta
 import os
 import re
 from time import sleep
+import subprocess
+from typing import List, Tuple, Callable
+
+# Third-party library imports
 import cv2
-from psutil import users
+import psutil
+import sqlite3
+import numpy as np
+import pandas as pd
+import tkinter as tk
+from tkinter import Entry, StringVar, ttk, messagebox, simpledialog, filedialog
+import seaborn as sns
+import pyzbar.pyzbar as pyzbar
+import matplotlib.pyplot as plt
+
+# Check and handle the import of OpenCV separately
 try:
     import cv2
 except ImportError as e:
     raise ImportError("Das Modul 'cv2' konnte nicht importiert werden. Stellen Sie sicher, dass es installiert ist.") from e
-import sqlite3
-import subprocess
-import numpy as np
-import pandas as pd
-import tkinter as tk
-import seaborn as sns
-import pyzbar.pyzbar as pyzbar
-from tkinter import messagebox
-import matplotlib.pyplot as plt
-from typing import List, Tuple, Callable
-from tkinter import ttk, messagebox, simpledialog, filedialog
+
 
 DB_NAME = "02_Lagerbank2024.db"  # Definiert den Namen der Datenbank
 
@@ -991,14 +997,180 @@ def create_admin_tab(tab: tk.Frame, db: Database):
             
             checkout_button = ttk.Button(tab, text="Checkout", command=last_day)
             checkout_button.grid(row=1, column=0, columnspan=2, pady=10)
-                    
+            
+        def fetch_participants(db):
+            query = '''
+                SELECT T_ID FROM Teilnehmer
+            '''
+            result = db.execute_select(query)
+            return [row[0] for row in result]
+
+        def calculate_future_expenses(participant_id, current_date, db):
+            # Summe der bisherigen Ausgaben des Teilnehmers berechnen
+            query = '''
+                SELECT SUM(P.Preis * T.Menge) AS TotalSpent
+                FROM Transaktion T
+                JOIN Produkt P ON T.P_ID = P.P_ID
+                JOIN Konto K ON T.K_ID = K.K_ID
+                JOIN Teilnehmer TN ON K.T_ID = TN.T_ID
+                WHERE TN.T_ID = ? AND T.Datum <= ?
+            '''
+            result = db.execute_select(query, (participant_id, current_date))
+            total_spent = result[0][0] if result[0][0] is not None else 0
+
+            # Tägliche Ausgaben berechnen
+            query = '''
+                SELECT DATE(T.Datum) AS TransDate, SUM(P.Preis * T.Menge) AS DailySpent
+                FROM Transaktion T
+                JOIN Produkt P ON T.P_ID = P.P_ID
+                JOIN Konto K ON T.K_ID = K.K_ID
+                JOIN Teilnehmer TN ON K.T_ID = TN.T_ID
+                WHERE TN.T_ID = ? AND T.Datum <= ?
+                GROUP BY DATE(T.Datum)
+            '''
+            result = db.execute_select(query, (participant_id, current_date))
+            daily_expenses = [row[1] for row in result]
+            num_days = len(daily_expenses)
+
+            if num_days == 0:
+                avg_daily_expense = 0
+            else:
+                avg_daily_expense = sum(daily_expenses) / num_days
+
+            # Zukünftige geschätzte Ausgaben bis zum Ende des Lagers
+            # Berechne das Enddatum des Lagers
+            query = '''
+                SELECT Wert
+                FROM Einstellungen
+                WHERE Name = 'Lagerdauer'
+            '''
+            result = db.execute_select(query)
+            lager_dauer = int(result[0][0])
+
+            query = '''
+                SELECT Wert
+                FROM Einstellungen
+                WHERE Name = 'ErsterTag'
+            '''
+            result = db.execute_select(query)
+            erster_tag = datetime.strptime(result[0][0], '%Y-%m-%d').date()
+
+            last_day = erster_tag + timedelta(days=lager_dauer)
+
+            # Berechne die verbleibenden Tage bis zum letzten Tag des Lagers
+            days_remaining = (last_day - current_date).days
+            future_expenses_estimate = avg_daily_expense * days_remaining
+
+            return total_spent, future_expenses_estimate
+
+        def check_balance_sufficiency(participant_id, db):
+            current_date = datetime.today().date()
+            total_spent, future_expenses_estimate = calculate_future_expenses(participant_id, current_date, db)
+
+            # Guthaben des Teilnehmers abrufen
+            query = '''
+                SELECT Kontostand
+                FROM Konto
+                WHERE T_ID = ?
+            '''
+            result = db.execute_select(query, (participant_id,))
+
+            available_balance = result[0][0] if result else 0
+            endkonto = available_balance - future_expenses_estimate
+            print(f"total_spent: {total_spent}")
+            print(f"future_expenses_estimate: {future_expenses_estimate}")
+            print(f"available_balance: {available_balance}")
+            print(f"endkonto: {endkonto}")
+
+            return endkonto,total_spent, future_expenses_estimate, available_balance
+
+        def create_ausgaben_statistik_tab(tab, db):
+            # Teilnehmer ID Eingabefeld und Label
+            participant_id_label = ttk.Label(tab, text="Teilnehmer ID:")
+            participant_id_label.grid(row=0, column=0, padx=10, pady=10)
+
+            participant_id_var = StringVar()
+            participant_id_combobox = ttk.Combobox(tab, textvariable=participant_id_var)
+            participant_id_combobox['values'] = fetch_participants(db)
+            participant_id_combobox.grid(row=0, column=1, padx=10, pady=10)
+
+            # Button zur Überprüfung des Guthabens
+            def update_labels():
+                endkonto,total_spent, future_expenses_estimate, available_balance = check_balance_sufficiency(participant_id_var.get(), db)
+                gesamtausgaben_wert_label.config(text=f"{total_spent:.2f}")
+                zukunftige_ausgaben_wert_label.config(text=f"{future_expenses_estimate:.2f}")
+                kontostand_wert_label.config(text=f"{available_balance:.2f}")
+                end_kontostand_wert_label.config(text=f"{endkonto:.2f}")
+
+            endkonto,total_spent, future_expenses_estimate, available_balance = check_balance_sufficiency(participant_id_var.get(), db)
+            gesamtausgaben_label = ttk.Label(tab, text="Gesamtausgaben des Teilnehmers:")
+            gesamtausgaben_label.grid(row=1, column=0, padx=10, pady=10)
+            gesamtausgaben_wert_label = ttk.Label(tab, text=f"{total_spent:.2f}")
+            gesamtausgaben_wert_label.grid(row=1, column=1, padx=10, pady=10)
+
+            zukunftige_ausgaben_label = ttk.Label(tab, text="Geschätzte zukünftige Ausgaben:")
+            zukunftige_ausgaben_label.grid(row=2, column=0, padx=10, pady=10)
+            zukunftige_ausgaben_wert_label = ttk.Label(tab, text=f"{future_expenses_estimate:.2f}")
+            zukunftige_ausgaben_wert_label.grid(row=2, column=1, padx=10, pady=10)
+
+            kontostand_label = ttk.Label(tab, text="Verfügbares Guthaben:")
+            kontostand_label.grid(row=3, column=0, padx=10, pady=10)
+            kontostand_wert_label = ttk.Label(tab, text=f"{available_balance:.2f}")
+            kontostand_wert_label.grid(row=3, column=1, padx=10, pady=10)
+            
+            end_kontostand_label = ttk.Label(tab, text="Endgültiger Kontostand:")
+            end_kontostand_label.grid(row=4, column=0, padx=10, pady=10)
+            end_kontostand_wert_label = ttk.Label(tab, text=f"{endkonto:.2f}")
+            end_kontostand_wert_label.grid(row=4, column=1, padx=10, pady=10)
+
+            check_button = ttk.Button(tab, text="Guthaben überprüfen", command=update_labels)
+            check_button.grid(row=5, column=0, columnspan=2, padx=10, pady=10)
+
+        def create_Einstellungen_tab(tab, db):
+            def set_lager_dauer():
+                try:
+                    lager_dauer = int(lager_dauer_entry.get())
+                    print(f"Lagerdauer: {lager_dauer}")
+                    db.execute_update("UPDATE Einstellungen SET Wert = ? WHERE Name = 'Lagerdauer'", (lager_dauer,))
+                    print("Lagerdauer erfolgreich aktualisiert.")
+                except Exception as e:
+                    print(f"Fehler beim Aktualisieren der Lagerdauer: {e}")
+
+            def set_first_Day():
+                try:
+                    first_day = first_day_entry.get()
+                    print(f"Erster Tag: {first_day}")
+                    db.execute_update("UPDATE Einstellungen SET Wert = ? WHERE Name = 'ErsterTag'", (first_day,))
+                    print("Erster Tag erfolgreich aktualisiert.")
+                except Exception as e:
+                    print(f"Fehler beim Aktualisieren des ersten Tags: {e}")
+
+            # First Day Widgets
+            first_day_label = ttk.Label(tab, text="Erster Tag:")
+            first_day_label.grid(row=0, column=0, padx=10, pady=10)
+            first_day_entry = ttk.Entry(tab)
+            first_day_entry.grid(row=0, column=1, padx=10, pady=10)
+
+            # Lager Dauer Widgets
+            lager_dauer_label = ttk.Label(tab, text="Lagerdauer (Tage):")
+            lager_dauer_label.grid(row=1, column=0, padx=10, pady=10)
+            lager_dauer_entry = ttk.Entry(tab)
+            lager_dauer_entry.grid(row=1, column=1, padx=10, pady=10)
+
+            # Submit Button
+            submit_button = ttk.Button(tab, text="Submit", command=lambda: [set_lager_dauer(), set_first_Day()])
+            submit_button.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
+
+        
         def create_inner_tab(parent, name, command):
             inner_tab = ttk.Frame(parent)
             command(inner_tab, db) 
             parent.add(inner_tab, text=name)
 
         def create_tabs(tab_control):
+            create_inner_tab(tab_control, "Einstellungen", create_Einstellungen_tab)
             create_inner_tab(tab_control, "Kaufstatistik", create_kaufstatistik_tab)
+            create_inner_tab(tab_control, "Ausgabenstatistik", create_ausgaben_statistik_tab)
             create_inner_tab(tab_control, "Geld aufteilen", Kontostand_aufteilen)
             create_inner_tab(tab_control, "Nutzer hinzufügen", add_user) 
             create_inner_tab(tab_control, "Einzahlung hinzufügen", add_fund) 
